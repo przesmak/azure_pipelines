@@ -1,0 +1,91 @@
+# Docker
+# Build and deploy a Docker image 
+# contact point: przemyslaw.smakulski@technipfmc.com
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+- master
+- main
+- feature/*
+
+resources:
+- repo: self
+
+variables:
+  tag: latest
+  image_name: 'mlpselector-docker'
+  app_name: 'mlpselector'
+  environment: 'dev'
+  cluster_name: null
+  region: 'eu-west-1'
+  task_definition_revision: null
+
+stages:
+- stage: Build
+  displayName: Build image
+  jobs:  
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AWSShellScript@1
+      displayName: 'Set cluster variable'
+      name: ClusterVar
+      inputs:
+        awsCredentials: 'AWS_cloud'
+        regionName: $(region)
+        scriptType: 'inline'
+        inlineScript: |
+          allClusters=`aws ecs list-clusters --region eu-west-1 --query "clusterArns" --output text`
+          currentCluster=`aws ecs describe-clusters --clusters $allClusters --region eu-west-1 --include TAGS --query "clusters[?tags[?key=='Environment'&&value=='$(environment)']&&tags[?key=='State'&&value=='current']].clusterName" --output text`
+          echo "Name of the cluseter:" $currentCluster
+          echo "##vso[task.setvariable variable=cluster_name]$currentCluster"
+    - bash: |
+          echo "creating/updating dev-package.json for docker build"
+          sed -e '/"proxy":/d' -e '4 a  "homepage": "/static/react",' frontend/package.json > frontend/dev-package.json
+          echo "$(cluster_name)"
+          echo '$(environment)'
+    - task: Docker@2
+      displayName: 'Build docker image'
+      inputs:
+        repository: '$(image_name)'
+        command: 'build'
+        Dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+        tags: '$(tag)'
+    - task: ECRPushImage@1
+      displayName: 'Push image to Amazon ECR'
+      inputs:
+        awsCredentials: 'AWS_cloud'
+        regionName: $(region)
+        imageSource: 'imagename'
+        autoCreateRepository: true
+        sourceImageTag: $(tag)
+        sourceImageName: $(image_name)
+        repositoryName: $(app_name)
+        pushTag: $(tag)
+    - task: AWSShellScript@1
+      displayName: 'Retrive old and register new task definition'
+      name: Register_new_task_definition 
+      inputs:
+        awsCredentials: 'AWS_cloud'
+        regionName: $(region)
+        scriptType: 'inline'
+        inlineScript: |
+          REGISTRY_ID=$(aws ecr describe-images --repository-name $(app_name) --image-ids imageTag=$(tag) --query imageDetails[0].registryId | sed 's/\"//g')
+          echo "Registry ID:" $REGISTRY_ID
+          aws ecs describe-task-definition --task-definition "$(app_name)-$(environment)" --query '{containerDefinitions: taskDefinition.containerDefinitions, family: taskDefinition.family, taskRoleArn: taskDefinition.taskRoleArn, executionRoleArn: taskDefinition.executionRoleArn, networkMode: taskDefinition.networkMode, volumes: taskDefinition.volumes, placementConstraints: taskDefinition.placementConstraints, requiresCompatibilities: taskDefinition.requiresCompatibilities, cpu: taskDefinition.cpu, memory: taskDefinition.memory}' > log.json
+          sed 's/.*image.*/\"image\": \"'$REGISTRY_ID'.dkr.ecr.'$(region)'.amazonaws.com\/'$(app_name)':'$(tag)'\",/' log.json > log2.json
+          TASK_DEFINITION_REVISION=$(aws ecs register-task-definition --cli-input-json file://log2.json --query taskDefinition.revision | sed 's/\"//g')
+          echo "New Task Definition revision:" $TASK_DEFINITION_REVISION
+          echo "Setting TD revision as global variable"
+          echo "##vso[task.setvariable variable=task_definition_revision]$TASK_DEFINITION_REVISION"
+    - task: AWSCLI@1
+      displayName: 'Update the service with registered task definition'
+      inputs:
+        awsCredentials: 'AWS_cloud'
+        regionName: $(region)
+        awsCommand: 'ecs'
+        awsSubCommand: 'update-service'
+        awsArguments: '--service $(app_name) --cluster $(cluster_name) --task-definition "$(app_name)-$(environment):$(task_definition_revision)" --force-new-deployment'
+
